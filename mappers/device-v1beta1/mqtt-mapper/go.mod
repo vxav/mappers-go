@@ -10,6 +10,7 @@ require (
 	github.com/kubeedge/kubeedge v1.18.0
 	github.com/kubeedge/mapper-framework v1.17.1-0.20240727071908-23ae39c11809
 	github.com/taosdata/driver-go/v3 v3.5.1
+	gopkg.in/yaml.v3 v3.0.1
 	k8s.io/klog/v2 v2.110.1
 )
 

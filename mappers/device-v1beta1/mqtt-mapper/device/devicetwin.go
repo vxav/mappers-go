@@ -9,11 +9,11 @@ import (
 
 	"k8s.io/klog/v2"
 
-	"github.com/kubeedge/mqtt/driver"
 	dmiapi "github.com/kubeedge/kubeedge/pkg/apis/dmi/v1beta1"
 	"github.com/kubeedge/mapper-framework/pkg/common"
 	"github.com/kubeedge/mapper-framework/pkg/grpcclient"
 	"github.com/kubeedge/mapper-framework/pkg/util/parse"
+	"github.com/kubeedge/mqtt/driver"
 )
 
 type TwinData struct {
@@ -37,7 +37,30 @@ func (td *TwinData) GetPayLoad() ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("get device data failed: %v", err)
 	}
-	sData, err := common.ConvertToString(td.Results)
+
+	// Extract the specific property value from the device data struct
+	var propertyValue interface{}
+	klog.V(3).Infof("TwinData.GetPayLoad() for %s.%s: td.Results type=%T", td.DeviceName, td.Name, td.Results)
+	if deviceData, ok := td.Results.(*driver.MQTTDeviceData); ok {
+		switch td.Name {
+		case "temperature":
+			propertyValue = deviceData.Temperature
+			klog.V(2).Infof("Twin data extracted temperature: %s", deviceData.Temperature)
+		case "status":
+			propertyValue = deviceData.Status
+			klog.V(2).Infof("Twin data extracted status: %s", deviceData.Status)
+		default:
+			// Fallback to the entire struct if property not found
+			propertyValue = td.Results
+			klog.V(2).Infof("Twin data using fallback for property %s", td.Name)
+		}
+	} else {
+		// Fallback if not the expected type
+		propertyValue = td.Results
+		klog.V(1).Infof("Twin data type assertion failed, using fallback")
+	}
+
+	sData, err := common.ConvertToString(propertyValue)
 	if err != nil {
 		klog.Errorf("Failed to convert %s %s value as string : %v", td.DeviceName, td.Name, err)
 		return nil, err
@@ -48,14 +71,17 @@ func (td *TwinData) GetPayLoad() ([]byte, error) {
 		klog.V(4).Infof("Get %s : %s ,value is %s", td.DeviceName, td.Name, sData)
 	}
 	var payload []byte
+	klog.V(3).Infof("Twin update topic: %s", td.Topic)
 	if strings.Contains(td.Topic, "$hw") {
 		if payload, err = common.CreateMessageTwinUpdate(td.Name, td.Type, sData, td.ObservedDesired.Value); err != nil {
 			return nil, fmt.Errorf("create message twin update failed: %v", err)
 		}
+		klog.V(3).Infof("Created twin update payload: %s", string(payload))
 	} else {
 		if payload, err = common.CreateMessageData(td.Name, td.Type, sData); err != nil {
 			return nil, fmt.Errorf("create message data failed: %v", err)
 		}
+		klog.V(3).Infof("Created data payload: %s", string(payload))
 	}
 	return payload, nil
 }
@@ -90,18 +116,26 @@ func (td *TwinData) PushToEdgeCore() {
 }
 
 func (td *TwinData) Run(ctx context.Context) {
+	klog.V(2).Infof("Starting twin data collection for %s.%s (cycle: %v)", td.DeviceName, td.Name, td.CollectCycle)
 	if !td.ReportToCloud {
+		klog.Warningf("Twin reporting disabled for %s.%s", td.DeviceName, td.Name)
 		return
 	}
 	if td.CollectCycle == 0 {
 		td.CollectCycle = common.DefaultCollectCycle
+		klog.V(2).Infof("Using default collect cycle for %s.%s: %v", td.DeviceName, td.Name, td.CollectCycle)
 	}
+
 	ticker := time.NewTicker(td.CollectCycle)
 	for {
 		select {
 		case <-ticker.C:
+			klog.V(3).Infof("Twin data ticker fired for %s.%s", td.DeviceName, td.Name)
 			td.PushToEdgeCore()
+			// Add a small delay to prevent rate limiting
+			time.Sleep(100 * time.Millisecond)
 		case <-ctx.Done():
+			klog.V(2).Infof("Twin data collection stopped for %s.%s", td.DeviceName, td.Name)
 			return
 		}
 	}

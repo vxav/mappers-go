@@ -5,29 +5,32 @@ import (
 	"encoding/xml"
 	"errors"
 	"fmt"
-	"gopkg.in/yaml.v3"
 	"reflect"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	mqtt "github.com/eclipse/paho.mqtt.golang"
+	"gopkg.in/yaml.v3"
+	"k8s.io/klog/v2"
+
 	"github.com/kubeedge/mapper-framework/pkg/common"
 )
 
 func NewClient(protocol ProtocolConfig) (*CustomizedClient, error) {
 	client := &CustomizedClient{
-		ProtocolConfig:    protocol,
-		deviceMutex:       sync.Mutex{},
-		TempMessage:       "",
-		DeviceConfigData:  nil,
+		ProtocolConfig:   protocol,
+		deviceMutex:      sync.Mutex{},
+		TempMessage:      "",
+		DeviceConfigData: nil,
 	}
 	return client, nil
 }
 
 func (c *CustomizedClient) InitDevice() error {
 	configData := &c.ProtocolConfig.ConfigData
-	_, operationInfo, _, err := configData.SplitTopic()
+	_, operationInfo, serializedFormat, err := configData.SplitTopic()
 	if operationInfo != DEVICEINfO {
 		return errors.New("This is not a device config.")
 	}
@@ -35,36 +38,77 @@ func (c *CustomizedClient) InitDevice() error {
 		return err
 	}
 	c.TempMessage = configData.Message
+
+	// Parse the message to initialize DeviceConfigData
+	parsedMessage, err := configData.ParseMessage(serializedFormat)
+	if err != nil {
+		return fmt.Errorf("failed to parse device config message: %v", err)
+	}
+
+	// Initialize the device data struct
+	deviceData := &MQTTDeviceData{}
+
+	// Populate the struct from the parsed message
+	if temp, ok := parsedMessage["temperature"]; ok {
+		if tempStr, ok := temp.(string); ok {
+			deviceData.Temperature = tempStr
+		}
+	}
+	if status, ok := parsedMessage["status"]; ok {
+		if statusStr, ok := status.(string); ok {
+			deviceData.Status = statusStr
+		}
+	}
+
+	// Set default status if not provided
+	if deviceData.Status == "" {
+		deviceData.Status = "online"
+	}
+
+	c.DeviceConfigData = deviceData
+
+	// Initialize MQTT client for receiving data updates
+	err = c.initMQTTSubscription()
+	if err != nil {
+		klog.Errorf("Failed to initialize MQTT subscription: %v", err)
+		// Don't return error - device can still work without MQTT updates
+	}
+
 	return nil
 }
 
 func (c *CustomizedClient) GetDeviceData(visitor *VisitorConfig) (interface{}, error) {
-	configData := &c.ProtocolConfig.ConfigData
-	_, operationInfo, _, err := configData.SplitTopic()
-	if operationInfo != DEVICEINfO {
-		return nil, errors.New("This is not a device config.")
+	// For twin reporting, we should return current device data regardless of protocol operation
+	c.dataMutex.RLock()
+	defer c.dataMutex.RUnlock()
+
+	if c.DeviceConfigData == nil {
+		return nil, errors.New("device config data is not initialized")
 	}
-	if err != nil {
-		return nil, err
-	}
-	visitor.ProcessOperation(c.DeviceConfigData)
+
+	klog.V(3).Infof("GetDeviceData() returning data (type: %T)", c.DeviceConfigData)
+	// We need to return the entire device data because the TwinData context
+	// will extract the correct field based on the property name.
+	// The getFieldByTag function will be used to extract the right property value.
 	return c.DeviceConfigData, nil
 }
 
 func (c *CustomizedClient) SetDeviceData(visitor *VisitorConfig) error {
-	configData := &c.ProtocolConfig.ConfigData
-	_, operationInfo, _, err := configData.SplitTopic()
-	if operationInfo == DEVICEINfO {
+	// Check the visitor's operation type directly instead of using protocol config
+	if visitor.VisitorConfigData.OperationInfo == DEVICEINfO {
 		return errors.New("This is a device config, not to set device data.")
 	}
-	if err != nil {
-		return err
-	}
 	visitor.ProcessOperation(c.DeviceConfigData)
-	return  nil
+	return nil
 }
 
 func (c *CustomizedClient) StopDevice() error {
+	// Disconnect MQTT client if connected
+	if c.mqttClient != nil && c.mqttClient.IsConnected() {
+		c.mqttClient.Disconnect(250)
+		klog.Info("Disconnected from MQTT broker")
+	}
+
 	updateFieldsByTag(c.DeviceConfigData, map[string]interface{}{
 		"status": common.DeviceStatusDisCONN,
 		"Status": common.DeviceStatusDisCONN,
@@ -86,7 +130,90 @@ func (c *CustomizedClient) GetDeviceStates(visitor *VisitorConfig) (string, erro
 		return common.DeviceStatusOK, nil
 	}
 	return res, nil
-	
+
+}
+
+// initMQTTSubscription initializes MQTT client and subscribes to device data topics
+func (c *CustomizedClient) initMQTTSubscription() error {
+	// Create MQTT client options
+	opts := mqtt.NewClientOptions()
+	opts.AddBroker(c.ProtocolConfig.ConfigData.BrokerURL)
+	opts.SetClientID(c.ProtocolConfig.ConfigData.ClientID + "_sub")
+	opts.SetUsername(c.ProtocolConfig.ConfigData.Username)
+	opts.SetPassword(c.ProtocolConfig.ConfigData.Password)
+	opts.SetAutoReconnect(true)
+	opts.SetCleanSession(true)
+
+	// Create and connect MQTT client
+	c.mqttClient = mqtt.NewClient(opts)
+	if token := c.mqttClient.Connect(); token.Wait() && token.Error() != nil {
+		return fmt.Errorf("failed to connect to MQTT broker: %v", token.Error())
+	}
+
+	klog.Infof("Connected to MQTT broker: %s", c.ProtocolConfig.ConfigData.BrokerURL)
+
+	// Subscribe to data update topics based on the device topic pattern
+	// Extract device path from protocol topic: "sensor/beta1-device/deviceinfo/json" -> "sensor/beta1-device"
+	topicParts := strings.Split(c.ProtocolConfig.ConfigData.Topic, "/")
+	if len(topicParts) >= 2 {
+		devicePath := strings.Join(topicParts[:len(topicParts)-2], "/")
+
+		// Subscribe to topics where device data updates will be published
+		dataTopics := []string{
+			devicePath + "/update/json",
+			devicePath + "/getsinglevalue/json",
+			devicePath + "/setsinglevalue/json",
+		}
+
+		for _, topic := range dataTopics {
+			if token := c.mqttClient.Subscribe(topic, 1, c.onMQTTMessage); token.Wait() && token.Error() != nil {
+				klog.Errorf("Failed to subscribe to topic %s: %v", topic, token.Error())
+			} else {
+				klog.V(2).Infof("Subscribed to MQTT topic: %s", topic)
+			}
+		}
+	}
+
+	return nil
+}
+
+// onMQTTMessage handles incoming MQTT messages and updates device data
+func (c *CustomizedClient) onMQTTMessage(client mqtt.Client, msg mqtt.Message) {
+	klog.V(2).Infof("Received MQTT message on topic %s: %s", msg.Topic(), string(msg.Payload()))
+
+	// Parse the incoming message
+	var messageData map[string]interface{}
+	if err := json.Unmarshal(msg.Payload(), &messageData); err != nil {
+		klog.Errorf("Failed to parse MQTT message: %v", err)
+		return
+	}
+
+	// Update device data in thread-safe manner
+	c.dataMutex.Lock()
+	defer c.dataMutex.Unlock()
+
+	if c.DeviceConfigData == nil {
+		c.DeviceConfigData = &MQTTDeviceData{}
+	}
+
+	// Update temperature if present
+	if temp, ok := messageData["temperature"]; ok {
+		if tempStr, ok := temp.(string); ok {
+			c.DeviceConfigData.Temperature = tempStr
+			klog.V(2).Infof("Updated device temperature to: %s", tempStr)
+		} else if tempFloat, ok := temp.(float64); ok {
+			c.DeviceConfigData.Temperature = fmt.Sprintf("%.1f", tempFloat)
+			klog.V(2).Infof("Updated device temperature to: %.1f", tempFloat)
+		}
+	}
+
+	// Update status if present
+	if status, ok := messageData["status"]; ok {
+		if statusStr, ok := status.(string); ok {
+			c.DeviceConfigData.Status = statusStr
+			klog.V(2).Infof("Updated device status to: %s", statusStr)
+		}
+	}
 }
 
 /* --------------------------------------------------------------------------------------- */
@@ -153,10 +280,10 @@ func (c *ConfigData) GetMessage() (string, error) {
 
 // OperationInfoType and SerializedFormatType mappings
 var operationTypeMap = map[string]OperationInfoType{
-	"update": UPDATE,
-	"deviceinfo": DEVICEINfO,
-	"setsinglevalue" : SETSINGLEVALUE,
-	"getsinglevalue" : GETSINGLEVALUE,
+	"update":         UPDATE,
+	"deviceinfo":     DEVICEINfO,
+	"setsinglevalue": SETSINGLEVALUE,
+	"getsinglevalue": GETSINGLEVALUE,
 }
 
 var serializedFormatMap = map[string]SerializedFormatType{
@@ -234,7 +361,7 @@ func (c *ConfigData) jsonParse() (map[string]interface{}, error) {
 }
 
 // The function parseYAML parses the Message field of the ConfigData (assumed to be a YAML string).
-func (c *ConfigData)yamlParse() (map[string]interface{}, error) {
+func (c *ConfigData) yamlParse() (map[string]interface{}, error) {
 	if c.Message == "" {
 		return nil, errors.New("message is empty")
 	}
@@ -248,7 +375,7 @@ func (c *ConfigData)yamlParse() (map[string]interface{}, error) {
 }
 
 // The function xmlParse parses the Message field of the ConfigData (assumed to be a XML string).
-func (c *ConfigData)xmlParse() (map[string]interface{}, error) {
+func (c *ConfigData) xmlParse() (map[string]interface{}, error) {
 	msg := c.Message
 	if strings.HasPrefix(msg, "<?xml") {
 		end := strings.Index(msg, "?>")
@@ -276,29 +403,29 @@ func (c *ConfigData)xmlParse() (map[string]interface{}, error) {
 
 // NewVisitorConfig creates a new instance of VisitorConfig using ConfigData pointer and the result of SplitTopic.
 func (c *ConfigData) NewVisitorConfig() (*VisitorConfig, error) {
-    // get ClientID
-    clientID, err := c.GetClientID()
-    if err != nil {
-        return nil, err
-    }
+	// get ClientID
+	clientID, err := c.GetClientID()
+	if err != nil {
+		return nil, err
+	}
 
-    // get DeviceInfo, OperationInfo and SerializedFormat
-    deviceInfo, operationInfo, serializedFormat, err := c.SplitTopic()
-    if err != nil {
-        return nil, err
-    }
+	// get DeviceInfo, OperationInfo and SerializedFormat
+	deviceInfo, operationInfo, serializedFormat, err := c.SplitTopic()
+	if err != nil {
+		return nil, err
+	}
 
-    // get ParsedMessage
-    parsedMessage, err := c.ParseMessage(serializedFormat)
-    if err != nil {
-        return nil, err
-    }
+	// get ParsedMessage
+	parsedMessage, err := c.ParseMessage(serializedFormat)
+	if err != nil {
+		return nil, err
+	}
 
-    // create
+	// create
 	return &VisitorConfig{
 		ProtocolName: "mqtt",
 		VisitorConfigData: VisitorConfigData{
-			DataType:         "DefaultDataType", 
+			DataType:         "DefaultDataType",
 			ClientID:         clientID,
 			DeviceInfo:       deviceInfo,
 			OperationInfo:    operationInfo,
@@ -322,13 +449,13 @@ func (v *VisitorConfig) ProcessOperation(deviceConfigData interface{}) error {
 	}
 
 	switch v.VisitorConfigData.OperationInfo {
-	case DEVICEINfO:  // device config data
+	case DEVICEINfO: // device config data
 		v.updateFullConfig(deviceConfigData)
 		return nil
-	case UPDATE:  // update the full text according the visitor config and the tag (json, yaml, xml)
+	case UPDATE: // update the full text according the visitor config and the tag (json, yaml, xml)
 		v.updateFullConfig(deviceConfigData)
 		return nil
-	case SETSINGLEVALUE:  // update the single value according the visitor config and the tag (json, yaml, xml)
+	case SETSINGLEVALUE: // update the single value according the visitor config and the tag (json, yaml, xml)
 		v.updateFieldsByTag(deviceConfigData)
 		return nil
 	default:
@@ -364,7 +491,7 @@ func (v *VisitorConfig) updateFullConfig(destDataConfig interface{}) error {
 	return nil
 }
 
-func (v *VisitorConfig)updateFieldsByTag(destDataConfig interface{}) error {
+func (v *VisitorConfig) updateFieldsByTag(destDataConfig interface{}) error {
 	vv := reflect.ValueOf(destDataConfig).Elem()
 
 	var tagName string
@@ -569,8 +696,17 @@ func updateFieldsByTag(s interface{}, updates map[string]interface{}, tagName st
 	return nil
 }
 
-func (v * VisitorConfig)getFieldByTag(s interface{}) (string, error) {
-	vv := reflect.ValueOf(s).Elem()
+func (v *VisitorConfig) getFieldByTag(s interface{}) (string, error) {
+	if s == nil {
+		return "", errors.New("device config data is nil")
+	}
+
+	rv := reflect.ValueOf(s)
+	if !rv.IsValid() || rv.IsNil() {
+		return "", errors.New("device config data is invalid or nil")
+	}
+
+	vv := rv.Elem()
 
 	var tagName string
 	switch v.VisitorConfigData.SerializedFormat {
@@ -617,4 +753,66 @@ func findFieldByTag(v reflect.Value, key string, tagName string) (string, error)
 	}
 	return "", fmt.Errorf("no such field with tag: %s", key)
 }
+
+// ConvertConfigDataToVisitorConfig converts simple ConfigData format to VisitorConfigData format
+func ConvertConfigDataToVisitorConfig(protocolName string, configData map[string]interface{}) (*VisitorConfig, error) {
+	// Extract topic to determine operation info and serialized format
+	topicStr, ok := configData["topic"].(string)
+	if !ok {
+		return nil, errors.New("topic field missing or not a string")
+	}
+
+	parts := strings.Split(topicStr, "/")
+	if len(parts) < 3 {
+		return nil, errors.New("topic format is invalid, must have at least three parts")
+	}
+
+	deviceInfo := strings.Join(parts[:len(parts)-2], "/")
+	operationStr := parts[len(parts)-2]
+	formatStr := parts[len(parts)-1]
+
+	// Convert operation string to enum
+	var operationInfo OperationInfoType
+	switch operationStr {
+	case "deviceinfo":
+		operationInfo = DEVICEINfO
+	case "update":
+		operationInfo = UPDATE
+	case "setsinglevalue":
+		operationInfo = SETSINGLEVALUE
+	case "getsinglevalue":
+		operationInfo = GETSINGLEVALUE
+	default:
+		operationInfo = GETSINGLEVALUE // default
+	}
+
+	// Convert format string to enum
+	var serializedFormat SerializedFormatType
+	switch formatStr {
+	case "json":
+		serializedFormat = JSON
+	case "yaml":
+		serializedFormat = YAML
+	case "xml":
+		serializedFormat = XML
+	default:
+		serializedFormat = JSON // default
+	}
+
+	// Extract clientID
+	clientID, _ := configData["clientID"].(string)
+
+	return &VisitorConfig{
+		ProtocolName: protocolName,
+		VisitorConfigData: VisitorConfigData{
+			DataType:         "string",
+			ClientID:         clientID,
+			DeviceInfo:       deviceInfo,
+			OperationInfo:    operationInfo,
+			SerializedFormat: serializedFormat,
+			ParsedMessage:    make(map[string]interface{}),
+		},
+	}, nil
+}
+
 /* --------------------------------------------------------------------------------------- */

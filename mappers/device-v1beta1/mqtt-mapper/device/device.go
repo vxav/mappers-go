@@ -13,6 +13,10 @@ import (
 
 	"k8s.io/klog/v2"
 
+	dmiapi "github.com/kubeedge/kubeedge/pkg/apis/dmi/v1beta1"
+	"github.com/kubeedge/mapper-framework/pkg/common"
+	"github.com/kubeedge/mapper-framework/pkg/global"
+	"github.com/kubeedge/mapper-framework/pkg/util/parse"
 	dbInflux "github.com/kubeedge/mqtt/data/dbmethod/influxdb2"
 	dbMysql "github.com/kubeedge/mqtt/data/dbmethod/mysql"
 	dbRedis "github.com/kubeedge/mqtt/data/dbmethod/redis"
@@ -21,10 +25,6 @@ import (
 	mqttMethod "github.com/kubeedge/mqtt/data/publish/mqtt"
 	"github.com/kubeedge/mqtt/data/stream"
 	"github.com/kubeedge/mqtt/driver"
-	dmiapi "github.com/kubeedge/kubeedge/pkg/apis/dmi/v1beta1"
-	"github.com/kubeedge/mapper-framework/pkg/common"
-	"github.com/kubeedge/mapper-framework/pkg/global"
-	"github.com/kubeedge/mapper-framework/pkg/util/parse"
 )
 
 type DevPanel struct {
@@ -113,11 +113,26 @@ func dataHandler(ctx context.Context, dev *driver.CustomizedDev) {
 		var visitorConfig driver.VisitorConfig
 
 		err := json.Unmarshal(twin.Property.Visitors, &visitorConfig)
-		visitorConfig.VisitorConfigData.DataType = strings.ToLower(visitorConfig.VisitorConfigData.DataType)
 		if err != nil {
-			klog.Errorf("Unmarshal VisitorConfig error: %v", err)
-			continue
+			// Try to unmarshal as simple config data format and convert
+			var simpleConfig struct {
+				ProtocolName string                 `json:"protocolName"`
+				ConfigData   map[string]interface{} `json:"configData"`
+			}
+			err2 := json.Unmarshal(twin.Property.Visitors, &simpleConfig)
+			if err2 != nil {
+				klog.Errorf("Unmarshal VisitorConfig error (both formats failed): %v, %v", err, err2)
+				continue
+			}
+			// Convert simple format to complex format
+			convertedConfig, err3 := driver.ConvertConfigDataToVisitorConfig(simpleConfig.ProtocolName, simpleConfig.ConfigData)
+			if err3 != nil {
+				klog.Errorf("Convert visitor config error: %v", err3)
+				continue
+			}
+			visitorConfig = *convertedConfig
 		}
+		visitorConfig.VisitorConfigData.DataType = strings.ToLower(visitorConfig.VisitorConfigData.DataType)
 		err = setVisitor(&visitorConfig, &twin, dev)
 		if err != nil {
 			klog.Error(err)
@@ -145,9 +160,10 @@ func dataHandler(ctx context.Context, dev *driver.CustomizedDev) {
 			ObservedDesired: twin.ObservedDesired,
 			VisitorConfig:   &visitorConfig,
 			Topic:           fmt.Sprintf(common.TopicTwinUpdate, dev.Instance.ID),
-			CollectCycle:    time.Millisecond * time.Duration(twin.Property.CollectCycle),
+			CollectCycle:    time.Duration(twin.Property.CollectCycle) * time.Millisecond,
 			ReportToCloud:   twin.Property.ReportToCloud,
 		}
+		klog.V(2).Infof("Creating twin data for %s.%s (cycle: %v)", dev.Instance.Name, twin.PropertyName, twinData.CollectCycle)
 		go twinData.Run(ctx)
 
 		//handle status
@@ -261,7 +277,12 @@ func setVisitor(visitorConfig *driver.VisitorConfig, twin *common.Twin, dev *dri
 		klog.Errorf("Failed to convert value as %s : %v", twin.Property.PProperty.DataType, err)
 		return err
 	}
-	err = dev.CustomizedClient.SetDeviceData(value, visitorConfig)
+	// Set the converted value in the visitor configuration's ParsedMessage
+	if visitorConfig.VisitorConfigData.ParsedMessage == nil {
+		visitorConfig.VisitorConfigData.ParsedMessage = make(map[string]interface{})
+	}
+	visitorConfig.VisitorConfigData.ParsedMessage[twin.PropertyName] = value
+	err = dev.CustomizedClient.SetDeviceData(visitorConfig)
 	if err != nil {
 		return fmt.Errorf("%s set device data error: %v", twin.PropertyName, err)
 	}
@@ -369,7 +390,21 @@ func getTwinData(deviceID string, twin common.Twin, dev *driver.CustomizedDev) (
 	var visitorConfig driver.VisitorConfig
 	err := json.Unmarshal(twin.Property.Visitors, &visitorConfig)
 	if err != nil {
-		return nil, err
+		// Try to unmarshal as simple config data format and convert
+		var simpleConfig struct {
+			ProtocolName string                 `json:"protocolName"`
+			ConfigData   map[string]interface{} `json:"configData"`
+		}
+		err2 := json.Unmarshal(twin.Property.Visitors, &simpleConfig)
+		if err2 != nil {
+			return nil, fmt.Errorf("unmarshal visitor config error (both formats failed): %v, %v", err, err2)
+		}
+		// Convert simple format to complex format
+		convertedConfig, err3 := driver.ConvertConfigDataToVisitorConfig(simpleConfig.ProtocolName, simpleConfig.ConfigData)
+		if err3 != nil {
+			return nil, fmt.Errorf("convert visitor config error: %v", err3)
+		}
+		visitorConfig = *convertedConfig
 	}
 	err = setVisitor(&visitorConfig, &twin, dev)
 	if err != nil {
@@ -475,9 +510,26 @@ func (d *DevPanel) GetTwinResult(deviceID string, twinName string) (string, stri
 		var visitorConfig driver.VisitorConfig
 		err := json.Unmarshal(twin.Property.Visitors, &visitorConfig)
 		if err != nil {
-			return "", "", err
+			// Try to unmarshal as simple config data format and convert
+			var simpleConfig struct {
+				ProtocolName string                 `json:"protocolName"`
+				ConfigData   map[string]interface{} `json:"configData"`
+			}
+			err2 := json.Unmarshal(twin.Property.Visitors, &simpleConfig)
+			if err2 != nil {
+				return "", "", fmt.Errorf("unmarshal visitor config error (both formats failed): %v, %v", err, err2)
+			}
+			// Convert simple format to complex format
+			convertedConfig, err3 := driver.ConvertConfigDataToVisitorConfig(simpleConfig.ProtocolName, simpleConfig.ConfigData)
+			if err3 != nil {
+				return "", "", fmt.Errorf("convert visitor config error: %v", err3)
+			}
+			visitorConfig = *convertedConfig
 		}
 		err = setVisitor(&visitorConfig, &twin, dev)
+		if err != nil {
+			return "", "", err
+		}
 
 		data, err := dev.CustomizedClient.GetDeviceData(&visitorConfig)
 		if err != nil {
