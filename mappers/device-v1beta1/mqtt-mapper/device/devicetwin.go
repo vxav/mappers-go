@@ -38,21 +38,18 @@ func (td *TwinData) GetPayLoad() ([]byte, error) {
 		return nil, fmt.Errorf("get device data failed: %v", err)
 	}
 
-	// Extract the specific property value from the device data struct
+	// Extract the specific property value from the device data map
 	var propertyValue interface{}
 	klog.V(3).Infof("TwinData.GetPayLoad() for %s.%s: td.Results type=%T", td.DeviceName, td.Name, td.Results)
-	if deviceData, ok := td.Results.(*driver.MQTTDeviceData); ok {
-		switch td.Name {
-		case "temperature":
-			propertyValue = deviceData.Temperature
-			klog.V(2).Infof("Twin data extracted temperature: %s", deviceData.Temperature)
-		case "status":
-			propertyValue = deviceData.Status
-			klog.V(2).Infof("Twin data extracted status: %s", deviceData.Status)
-		default:
-			// Fallback to the entire struct if property not found
-			propertyValue = td.Results
-			klog.V(2).Infof("Twin data using fallback for property %s", td.Name)
+	if deviceData, ok := td.Results.(driver.MQTTDeviceData); ok {
+		// Try to get the specific property by name
+		if value, exists := deviceData[td.Name]; exists {
+			propertyValue = value
+			klog.V(2).Infof("Twin data extracted %s: %v", td.Name, value)
+		} else {
+			// If property not found, return a default value or error indication
+			propertyValue = ""
+			klog.V(1).Infof("Property %s not found in device data, using empty value", td.Name)
 		}
 	} else {
 		// Fallback if not the expected type

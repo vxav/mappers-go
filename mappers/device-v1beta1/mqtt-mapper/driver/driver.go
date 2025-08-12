@@ -45,24 +45,17 @@ func (c *CustomizedClient) InitDevice() error {
 		return fmt.Errorf("failed to parse device config message: %v", err)
 	}
 
-	// Initialize the device data struct
-	deviceData := &MQTTDeviceData{}
+	// Initialize the device data as a map to support dynamic properties
+	deviceData := make(MQTTDeviceData)
 
-	// Populate the struct from the parsed message
-	if temp, ok := parsedMessage["temperature"]; ok {
-		if tempStr, ok := temp.(string); ok {
-			deviceData.Temperature = tempStr
-		}
-	}
-	if status, ok := parsedMessage["status"]; ok {
-		if statusStr, ok := status.(string); ok {
-			deviceData.Status = statusStr
-		}
+	// Populate the map from the parsed message - any property is now supported
+	for key, value := range parsedMessage {
+		deviceData[key] = value
 	}
 
-	// Set default status if not provided
-	if deviceData.Status == "" {
-		deviceData.Status = "online"
+	// Set default status if not provided (keep this for backward compatibility)
+	if _, exists := deviceData["status"]; !exists {
+		deviceData["status"] = "online"
 	}
 
 	c.DeviceConfigData = deviceData
@@ -109,28 +102,32 @@ func (c *CustomizedClient) StopDevice() error {
 		klog.Info("Disconnected from MQTT broker")
 	}
 
-	updateFieldsByTag(c.DeviceConfigData, map[string]interface{}{
-		"status": common.DeviceStatusDisCONN,
-		"Status": common.DeviceStatusDisCONN,
-	}, "json")
-	updateFieldsByTag(c.DeviceConfigData, map[string]interface{}{
-		"status": common.DeviceStatusDisCONN,
-		"Status": common.DeviceStatusDisCONN,
-	}, "yaml")
-	updateFieldsByTag(c.DeviceConfigData, map[string]interface{}{
-		"status": common.DeviceStatusDisCONN,
-		"Status": common.DeviceStatusDisCONN,
-	}, "xml")
+	// Update status in the device data map
+	c.dataMutex.Lock()
+	defer c.dataMutex.Unlock()
+
+	if c.DeviceConfigData != nil {
+		c.DeviceConfigData["status"] = common.DeviceStatusDisCONN
+	}
 	return nil
 }
 
 func (c *CustomizedClient) GetDeviceStates(visitor *VisitorConfig) (string, error) {
-	res, err := visitor.getFieldByTag(c.DeviceConfigData)
-	if err != nil {
+	c.dataMutex.RLock()
+	defer c.dataMutex.RUnlock()
+
+	if c.DeviceConfigData == nil {
 		return common.DeviceStatusOK, nil
 	}
-	return res, nil
 
+	// Check for status field in the device data
+	if status, exists := c.DeviceConfigData["status"]; exists {
+		if statusStr, ok := status.(string); ok {
+			return statusStr, nil
+		}
+	}
+
+	return common.DeviceStatusOK, nil
 }
 
 // initMQTTSubscription initializes MQTT client and subscribes to device data topics
@@ -193,26 +190,28 @@ func (c *CustomizedClient) onMQTTMessage(client mqtt.Client, msg mqtt.Message) {
 	defer c.dataMutex.Unlock()
 
 	if c.DeviceConfigData == nil {
-		c.DeviceConfigData = &MQTTDeviceData{}
+		c.DeviceConfigData = make(MQTTDeviceData)
 	}
 
-	// Update temperature if present
-	if temp, ok := messageData["temperature"]; ok {
-		if tempStr, ok := temp.(string); ok {
-			c.DeviceConfigData.Temperature = tempStr
-			klog.V(2).Infof("Updated device temperature to: %s", tempStr)
-		} else if tempFloat, ok := temp.(float64); ok {
-			c.DeviceConfigData.Temperature = fmt.Sprintf("%.1f", tempFloat)
-			klog.V(2).Infof("Updated device temperature to: %.1f", tempFloat)
+	// Update any properties present in the message
+	for key, value := range messageData {
+		// Convert different value types to appropriate format
+		var convertedValue interface{}
+		switch v := value.(type) {
+		case string:
+			convertedValue = v
+		case float64:
+			convertedValue = fmt.Sprintf("%.1f", v)
+		case int:
+			convertedValue = fmt.Sprintf("%d", v)
+		case bool:
+			convertedValue = fmt.Sprintf("%t", v)
+		default:
+			convertedValue = fmt.Sprintf("%v", v)
 		}
-	}
 
-	// Update status if present
-	if status, ok := messageData["status"]; ok {
-		if statusStr, ok := status.(string); ok {
-			c.DeviceConfigData.Status = statusStr
-			klog.V(2).Infof("Updated device status to: %s", statusStr)
-		}
+		c.DeviceConfigData[key] = convertedValue
+		klog.V(2).Infof("Updated device property %s to: %v", key, convertedValue)
 	}
 }
 
@@ -464,54 +463,52 @@ func (v *VisitorConfig) ProcessOperation(deviceConfigData interface{}) error {
 }
 
 func (v *VisitorConfig) updateFullConfig(destDataConfig interface{}) error {
-	destValue := reflect.ValueOf(destDataConfig)
-	if destValue.Kind() != reflect.Ptr || destValue.Elem().Kind() != reflect.Struct {
-		return errors.New("destDataConfig must be a pointer to a struct")
+	// Handle MQTTDeviceData map
+	if deviceMap, ok := destDataConfig.(MQTTDeviceData); ok {
+		// Clear existing data and replace with new data
+		for k := range deviceMap {
+			delete(deviceMap, k)
+		}
+		for key, value := range v.VisitorConfigData.ParsedMessage {
+			deviceMap[key] = value
+		}
+		return nil
 	}
 
-	destValue = destValue.Elem()
-
-	var tagName string
-	switch v.VisitorConfigData.SerializedFormat {
-	case JSON:
-		tagName = "json"
-	case YAML:
-		tagName = "yaml"
-	case XML:
-		tagName = "xml"
-	default:
-		return errors.New("unknown serialized format")
+	// Handle pointer to MQTTDeviceData map
+	if deviceMapPtr, ok := destDataConfig.(*MQTTDeviceData); ok && deviceMapPtr != nil {
+		// Clear existing data and replace with new data
+		for k := range *deviceMapPtr {
+			delete(*deviceMapPtr, k)
+		}
+		for key, value := range v.VisitorConfigData.ParsedMessage {
+			(*deviceMapPtr)[key] = value
+		}
+		return nil
 	}
 
-	// Update the destination struct using JSON tag
-	if err := updateStructFields(destValue, v.VisitorConfigData.ParsedMessage, tagName); err != nil {
-		return err
-	}
-
-	return nil
+	return errors.New("destDataConfig must be MQTTDeviceData map")
 }
 
 func (v *VisitorConfig) updateFieldsByTag(destDataConfig interface{}) error {
-	vv := reflect.ValueOf(destDataConfig).Elem()
-
-	var tagName string
-	switch v.VisitorConfigData.SerializedFormat {
-	case JSON:
-		tagName = "json"
-	case YAML:
-		tagName = "yaml"
-	case XML:
-		tagName = "xml"
-	default:
-		return errors.New("unknown serialized format")
-	}
-
-	for key, value := range v.VisitorConfigData.ParsedMessage {
-		if err := setFieldByTag(vv, key, value, tagName); err != nil {
-			return err
+	// Convert to map if it's MQTTDeviceData
+	if deviceMap, ok := destDataConfig.(MQTTDeviceData); ok {
+		// Update the map directly
+		for key, value := range v.VisitorConfigData.ParsedMessage {
+			deviceMap[key] = value
 		}
+		return nil
 	}
-	return nil
+
+	// If it's a pointer to map, dereference it
+	if deviceMapPtr, ok := destDataConfig.(*MQTTDeviceData); ok && deviceMapPtr != nil {
+		for key, value := range v.VisitorConfigData.ParsedMessage {
+			(*deviceMapPtr)[key] = value
+		}
+		return nil
+	}
+
+	return errors.New("destDataConfig must be MQTTDeviceData map")
 }
 
 /* --------------------------------------------------------------------------------------- */

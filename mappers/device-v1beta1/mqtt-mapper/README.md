@@ -4,6 +4,7 @@ A KubeEdge device mapper that connects MQTT devices to the KubeEdge ecosystem, e
 
 ## Features
 
+- **Dynamic Property Support**: Works with any property names defined in your device model (not limited to temperature/status)
 - **Real-time MQTT Device Communication**: Connects to MQTT devices and collects sensor data
 - **Device Twin Synchronization**: Automatically updates Kubernetes Device status with live data
 - **Multi-format Support**: Handles JSON, YAML, and XML message formats
@@ -37,6 +38,8 @@ docker push vxav/mqttmapper
 ```
 
 ### 1. Deploy Device Model
+
+**Important**: This mapper now supports any property names you define in your device model. You're not limited to just "temperature" and "status" - you can use any property names that match your device's data structure.
 
 Create a device model that defines the properties your MQTT device exposes:
 
@@ -269,6 +272,33 @@ Use mosquitto_pub to simulate device data:
 mosquitto_pub -h your-mqtt-broker \
   -t sensor/beta1-device/update/json \
   -m '{"temperature": "25.7", "status": "online"}'
+
+## Dynamic Property Support
+
+This mapper has been updated to support any property names defined in your device model, not just "temperature" and "status". You can now create device models with properties like:
+
+- `humidity`, `pressure`, `battery_level` 
+- `rpm`, `voltage`, `current`
+- `co2_level`, `air_quality`, `noise_level`
+- Any custom property names your device supports
+
+The mapper will automatically:
+1. Parse all properties from the device config message
+2. Subscribe to MQTT updates for any property
+3. Report twin data for all defined properties
+4. Handle any data types (string, numeric, boolean)
+
+### Example: Environmental Sensor
+
+See `examples/sensor-model.yaml` and `examples/sensor-instance.yaml` for a complete example of a multi-property environmental sensor with humidity, pressure, battery level, and status properties.
+
+To test with different properties:
+
+```bash
+# Send multi-property update
+mosquitto_pub -h your-mqtt-broker \
+  -t "sensor/environmental-sensor/update/json" \
+  -m '{"humidity": "65.2", "pressure": "1015.3", "battery_level": "78", "status": "online"}'
 ```
 
 ### Watch Device Updates
