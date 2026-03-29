@@ -23,9 +23,9 @@ import (
 
 	"k8s.io/klog/v2"
 
-	"github.com/kubeedge/mqtt/driver"
 	dmiapi "github.com/kubeedge/kubeedge/pkg/apis/dmi/v1beta1"
 	"github.com/kubeedge/mapper-framework/pkg/grpcclient"
+	"github.com/kubeedge/mqtt/driver"
 )
 
 // DeviceStates is structure for getting device states.
@@ -37,7 +37,7 @@ type DeviceStates struct {
 
 // Run timer function.
 func (deviceStates *DeviceStates) PushStatesToEdgeCore() {
-	states, error := deviceStates.Client.GetDeviceStates()
+	states, error := deviceStates.Client.GetDeviceStates(&driver.VisitorConfig{})
 	if error != nil {
 		klog.Errorf("GetDeviceStates failed: %v", error)
 		return
@@ -49,7 +49,7 @@ func (deviceStates *DeviceStates) PushStatesToEdgeCore() {
 		DeviceNamespace: deviceStates.DeviceNamespace,
 	}
 
-	log.Printf("send statesRequest", statesRequest.DeviceName, statesRequest.State)
+	log.Printf("send statesRequest: device=%s state=%s", statesRequest.DeviceName, statesRequest.State)
 	if err := grpcclient.ReportDeviceStates(statesRequest); err != nil {
 		klog.Errorf("fail to report device states of %s with err: %+v", deviceStates.DeviceName, err)
 	}

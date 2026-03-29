@@ -4,6 +4,7 @@ import (
 	"sync"
 	"time"
 
+	mqtt "github.com/eclipse/paho.mqtt.golang"
 	"github.com/kubeedge/mapper-framework/pkg/common"
 )
 
@@ -17,9 +18,15 @@ type CustomizedClient struct {
 	// TODO add some variables to help you better implement device drivers
 	deviceMutex sync.Mutex
 	ProtocolConfig
-	TempMessage      string      `json:"tempMessage"`
-	DeviceConfigData interface{} `json:"deviceConfigData"`
+	TempMessage      string         `json:"tempMessage"`
+	DeviceConfigData MQTTDeviceData `json:"deviceConfigData"`
+	mqttClient       mqtt.Client    // MQTT client for subscriptions
+	dataMutex        sync.RWMutex   // Mutex for thread-safe data updates
 }
+
+// MQTTDeviceData represents the actual device data structure
+// Using map to support dynamic properties instead of hardcoded fields
+type MQTTDeviceData map[string]interface{}
 
 type ProtocolConfig struct {
 	ProtocolName string `json:"protocolName"`
